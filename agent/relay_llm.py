@@ -8,6 +8,7 @@ import contextvars
 import inspect
 import json
 import logging
+import threading
 from collections.abc import Callable, Iterator
 from functools import partial
 from types import SimpleNamespace
@@ -349,6 +350,72 @@ class ManagedLlmStream(Iterator[Any]):
         """Relay's provider callback: run the factory and yield JSON-encoded chunks."""
         run_callback = attempt.run_callback
         raw_stream = None
+        # The raw provider iterator is advanced on a worker thread (asyncio.to_thread).
+        # A thread cannot be cancelled, so when Relay closes this stream mid-read the
+        # worker may still be executing the iterator. Calling its close() from this
+        # coroutine's ``finally`` in that window raises ``ValueError: generator already
+        # executing`` and would tear down a generator the worker still owns. Track the
+        # read under a lock and hand the close to whichever side is not executing it:
+        # immediately when the iterator is idle, otherwise deferred to the worker the
+        # moment its read returns.
+        close_guard = threading.Lock()
+        close_state = {"reading": False, "close_requested": False, "closed": False}
+
+        def _claim_close() -> bool:
+            """Take ownership of the close iff no worker is executing the iterator.
+
+            The claim is taken under the same lock that gates a read's ENTRY, so the
+            two decisions can never overlap: either the worker already claimed
+            ``reading`` and the caller defers instead, or the claim lands first and
+            the worker sees ``closed`` and never enters the iterator.
+            """
+            with close_guard:
+                if close_state["closed"]:
+                    return False
+                if close_state["reading"]:
+                    close_state["close_requested"] = True
+                    return False
+                close_state["closed"] = True
+                return True
+
+        def _close_when_safe() -> None:
+            """Close the provider iterator once, and only while it is not executing."""
+            if not _claim_close():
+                return
+            close = getattr(raw_stream, "close", None)
+            if callable(close):
+                run_callback(close)
+
+        def _read_next_chunk() -> tuple[Any, bool]:
+            # Claim the iterator under the same lock the closer claims it with, for
+            # the same reason: a close that already claimed it makes this read a
+            # no-op instead of a second entrant into an executing generator. Claiming
+            # the read before the executor picks the work item up would cover the
+            # same window, but it leaks the close whenever the queued item is
+            # cancelled, so the claim stays here.
+            with close_guard:
+                if close_state["closed"]:
+                    return None, True
+                close_state["reading"] = True
+            try:
+                return _next_provider_chunk(run_callback, raw_iterator)
+            finally:
+                with close_guard:
+                    close_state["reading"] = False
+                    deferred = close_state["close_requested"]
+                if deferred:
+                    # This worker was the one executing the iterator when the close
+                    # was requested; it is suspended again now, so closing here is
+                    # safe and is what releases the provider's own cleanup.
+                    try:
+                        _close_when_safe()
+                    except BaseException:
+                        logger.warning(
+                            "Deferred provider stream close failed after the read "
+                            "returned; the iterator may not have released its resources",
+                            exc_info=True,
+                        )
+
         try:
             raw_stream = run_callback(self._stream_factory, attempt.provider_request(next_request))
             predicate = self._completed_response_predicate
@@ -363,7 +430,7 @@ class ManagedLlmStream(Iterator[Any]):
                 # Off the loop: Relay pulls the next provider chunk before it hands over the
                 # current one, so a blocking read here withholds each chunk until the provider
                 # sends the next. Text vanishes for every provider pause and a steer aborts it.
-                chunk, exhausted = await asyncio.to_thread(_next_provider_chunk, run_callback, raw_iterator)
+                chunk, exhausted = await asyncio.to_thread(_read_next_chunk)
                 if exhausted:
                     break
                 if self._accept_chunk is not None and not run_callback(self._accept_chunk, chunk):
@@ -376,13 +443,11 @@ class ManagedLlmStream(Iterator[Any]):
             self._callback_error = exc
             raise
         finally:
-            close = getattr(raw_stream, "close", None)
-            if callable(close):
-                try:
-                    run_callback(close)
-                except BaseException as exc:
-                    self._close_error = exc
-                    raise
+            try:
+                _close_when_safe()
+            except BaseException as exc:
+                self._close_error = exc
+                raise
 
     def _relay_finalizer(self, attempt: _ManagedAttempt) -> Any:
         # Relay may call this while unwinding a provider-stream failure; keep the original

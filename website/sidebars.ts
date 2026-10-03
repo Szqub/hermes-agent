@@ -854,6 +854,7 @@ const sidebars: SidebarsConfig = {
             'developer-guide/egress-internals',
             'developer-guide/gateway-monitoring',
             'developer-guide/relay-connector-contract',
+            'developer-guide/relay-managed-stream-ownership',
             'developer-guide/relay-shared-metrics',
             'developer-guide/streaming-tts',
             'developer-guide/billing-lifecycle',
