@@ -1,0 +1,29 @@
+## Verdict
+APPROVE — the handshake is race-free under every interleaving I could construct, the test provably fails pre-fix with exactly the issue's `ValueError('generator already executing')` and passes 3/3 post-fix, and no new failures appear in the relay suites.
+
+## Verified claims
+- `git show 20f0a164` — diff read in full: 66 lines in `agent/relay_llm.py` (lock-guarded `reading`/`close_requested`/`closed` handshake around the existing `asyncio.to_thread` read), +54-line test, +89-line doc page, 1-line `sidebars.ts` insert.
+- `pytest tests/agent/test_relay_blocked_generator_interrupt.py` x3 on the commit: `1 passed` each time (2.46s / 2.60s / 2.60s).
+- "Test bites" proof: the checkout was clean at `20f0a164`, so `git stash push -- agent/relay_llm.py` reported "No local changes to save" (the prompt's step 5 assumed a dirty tree). I instead did `git checkout bd0affe5 -- agent/relay_llm.py`, re-ran, and got `FAILED` with `AssertionError: ["ValueError('generator already executing')"]` at `assert not close_errors` (test line 46) — exactly the pre-fix symptom. Restored with `git checkout 20f0a164 -- agent/relay_llm.py`; `git status --short` clean afterwards.
+- `pytest tests/agent/test_relay_llm.py test_relay_tools.py test_relay_runtime_plugins.py test_relay_atof_cwd.py`: 84 passed, 7 failed. All 7 are the known environment failures (`initialize() got an unexpected keyword argument 'additional_plugins_toml'` — the stale `nemo_relay`). Note: the prompt said "four" pre-existing failures in `test_relay_runtime_plugins.py`; I observed five there (1 tools + 5 plugins + 1 atof = 7 total). I verified all five also fail with `agent/relay_llm.py` at the parent `bd0affe5` — pre-existing, not a regression. The commit message's own count of 7 matches my observation.
+- `py_compile` passes on both changed Python files; `threading` import is used; `sidebars.ts` entry sits alphabetically between `relay-connector-contract` and `relay-shared-metrics` and the file exists.
+- `_ACLOSE_TIMEOUT = 10.0` (agent/relay_llm.py:28) — bounds the consumer-side aclose on the interrupted path.
+
+## Findings
+1. minor, agent/relay_llm.py:418 — queued-worker/idle-close window (reasoning only, not observed). If cancellation lands after `asyncio.to_thread(_read_next_chunk)` is submitted but before the worker sets `reading=True`, `_close_when_safe()` sees `reading=False` and closes the iterator inline; the worker then starts and calls `next()` on a closed generator. For a plain Python generator this raises `StopIteration`, which `_next_provider_chunk` already maps to `exhausted=True`, and `_close_raw_stream()` no-ops via the `closed` flag — benign, no leaked thread. For a non-generator iterator whose `close()` has other semantics, the post-close `next()` behavior is iterator-defined. No fix required; a one-line comment in `_read_next_chunk` ("may run against an already-closed iterator if the close won the executor race; StopIteration maps to exhausted") would document it.
+2. minor, agent/relay_llm.py:392-404 — deferred close is unbounded by design. If the provider's `next()` blocks forever, the raw generator's `finally` never runs and the executor worker thread (non-daemon, from the loop's default `ThreadPoolExecutor`) lives until process exit. The consumer side is still bounded (`_ACLOSE_TIMEOUT`), the lease is released, and the doc page states this bound honestly ("bounded by the provider, not by the interrupt"), so this is accepted design, not a defect — flagged only so the maintainer confirms the trade-off consciously.
+3. nit, tests/agent/test_relay_blocked_generator_interrupt.py:54 — file ends without a trailing newline (`od -c` shows last bytes `N o n e`).
+4. nit, tests/agent/test_relay_blocked_generator_interrupt.py:24-25 — the `SIGALRM` fires at 0.5s and the handler asserts `entered.is_set()`; on a severely loaded host the worker might not have started, producing a loud flake rather than a silent pass. Acceptable for a regression test; `release.wait(5)` bounds the hang.
+5. nit — `close_state["close_requested"]` is never reset after a deferred close completes. Harmless (the `closed` flag makes everything idempotent), but a reader may wonder.
+
+No double-close path exists (`closed` is set under `close_guard` before the close runs). No missed-close path exists (the worker clears `reading` and reads `close_requested` in one lock hold; the closer sets `close_requested` under the same lock, so the two orderings both end in exactly one close). No close-while-executing path exists (`_close_raw_stream` is reached only when `reading` is False, or from the worker itself after its read returned). `run_callback` from the worker thread is safe: it runs `attempt.context.copy().run(...)` — the captured `Context` is only ever copied, never entered on two threads. The object closed is `raw_stream`, matching pre-change behavior (identical object for generators).
+
+## What is good
+- The reproduction is a real end-to-end test (real `relay_turn` fixture, real POSIX signal, real blocking generator) and asserts the full contract: interrupt propagates, `close()` doesn't raise, provider `finally` runs, workers exit, `_loop`/`_runtime_lease` released.
+- Comments and the doc page keep the WHY and match the code as written; no invented behavior.
+- One logical change; the read primitive `_next_provider_chunk` is untouched; commit message carries its own before/after evidence and correctly names the 7 pre-existing environment failures.
+
+## Residual risk
+- Finding 1's benign `StopIteration` path is unverified at runtime (reasoning from generator semantics, not a probe run).
+- I could not run the website build, so the `sidebars.ts` edit is verified only by placement/ID, not by a Docusaurus compile.
+- Deferred-close behavior against a real provider SDK iterator (not a plain generator) is untested here; the environment's `nemo_relay` is too old for those integration paths.
