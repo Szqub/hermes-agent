@@ -1,8 +1,10 @@
 """Interrupting a Relay-managed provider read must not close the generator
 the worker thread is still executing.
 
-A real SIGINT, delivered with `_thread.interrupt_main()` so the same test runs
-on every host, raises KeyboardInterrupt on the calling thread while the
+Regression for #132048.
+
+SIGINT delivered with ``pthread_kill`` on POSIX or ``interrupt_main`` on
+Windows raises KeyboardInterrupt on the calling thread while the
 provider blocks inside `next()` on a worker thread, then the stream is closed
 explicitly. Before the fix, `ManagedLlmStream.close()` called `close()` on the
 actively executing provider generator and raised
@@ -43,6 +45,14 @@ pytest.importorskip("nemo_relay")
 from agent import relay_llm, relay_runtime
 
 
+def _interrupt_main_thread() -> None:
+    if hasattr(signal, "pthread_kill"):
+        # A real signal wakes POSIX select(); interrupt_main only sets a flag.
+        signal.pthread_kill(threading.main_thread().ident, signal.SIGINT)
+    else:
+        _thread.interrupt_main(signal.SIGINT)
+
+
 def _interrupt_when_entered(entered: threading.Event, delay: float = 2.0) -> threading.Event:
     """Interrupt the calling thread only once the provider is inside ``next()``.
 
@@ -50,13 +60,14 @@ def _interrupt_when_entered(entered: threading.Event, delay: float = 2.0) -> thr
     executor starts the worker: on a loaded machine it can land before the
     provider has entered, and the handler's own precondition fails. Waiting on
     the provider's event makes the start deterministic. Setting the returned
-    event disarms an interrupt that has not fired yet.
+    event disarms an interrupt that has not fired yet. The delay lets stream
+    construction return before interrupting the consumer.
     """
     disarmed = threading.Event()
 
     def fire() -> None:
         if entered.wait(10) and not disarmed.wait(delay):
-            _thread.interrupt_main(signal.SIGINT)
+            _interrupt_main_thread()
 
     threading.Thread(target=fire, daemon=True).start()
     return disarmed
@@ -105,8 +116,7 @@ def test_signal_during_blocked_provider(relay_turn):
 
     previous = signal.signal(signal.SIGINT, interrupt)
     # The release timer outlives the interrupt, and the interrupt fires only once
-    # the provider is confirmed inside next(); both bounds stay >= 2s so a loaded
-    # machine cannot reorder them (tests/AGENTS.md flake policy).
+    # the provider is confirmed inside next(); the event orders their start.
     timer = threading.Timer(8.0, release.set)
     timer.start()
     stream = None
