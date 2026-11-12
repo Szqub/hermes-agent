@@ -11,11 +11,11 @@ actively executing provider generator and raised
 `ValueError: generator already executing` — and the generator's own `finally`
 never ran.
 
-Deferring the close hands it to whichever side is not executing the iterator. A
+Deferring a Python generator's close hands it to the side not executing it. A
 close claimed by the deferred path runs `close()` on the worker thread *after*
 its read returns, so whatever that close raises lands on a thread with no caller
 to propagate to: it is logged and swallowed. `test_failed_deferred_close_is_logged_not_raised`
-pins that, so a provider whose `close()` fails cannot turn a deliberate
+pins that, so a generator whose `close()` fails cannot turn a deliberate
 interrupt into a second, unrelated exception for the caller.
 
 The remaining branch — a read that arrives after the close already claimed the
@@ -28,6 +28,9 @@ test requires a hook into the executor hand-off (`asyncio.to_thread`), which
 this suite deliberately does not fake; the branch is guarded by the same claim
 invariant as the deferred path, and a close losing that race is exactly what
 the no-op read exists to absorb.
+
+Non-generator SDK handles retain immediate close, which may be required to
+unblock their pending read; the SDK test is an anti-regression passing on base.
 """
 
 from __future__ import annotations
@@ -53,24 +56,24 @@ def _interrupt_main_thread() -> None:
         _thread.interrupt_main(signal.SIGINT)
 
 
-def _interrupt_when_entered(entered: threading.Event, delay: float = 2.0) -> threading.Event:
-    """Interrupt the calling thread only once the provider is inside ``next()``.
+def _interrupt_when_entered(
+    entered: threading.Event, stream_ready: threading.Event,
+) -> tuple[threading.Event, threading.Thread]:
+    """Send only after the provider enters and the caller has assigned its stream.
 
-    Firing up front makes the interrupt's arrival depend on how fast the
-    executor starts the worker: on a loaded machine it can land before the
-    provider has entered, and the handler's own precondition fails. Waiting on
-    the provider's event makes the start deterministic. Setting the returned
-    event disarms an interrupt that has not fired yet. The delay lets stream
-    construction return before interrupting the consumer.
+    The caller disarms and joins the sender before restoring its SIGINT handler.
+    Both waits are bounded so failed stream construction cannot leak a sender.
+    After assignment, a short buffer lets the consumer enter its blocking read.
     """
     disarmed = threading.Event()
 
     def fire() -> None:
-        if entered.wait(10) and not disarmed.wait(delay):
+        if entered.wait(10) and stream_ready.wait(10) and not disarmed.wait(2):
             _interrupt_main_thread()
 
-    threading.Thread(target=fire, daemon=True).start()
-    return disarmed
+    sender = threading.Thread(target=fire, daemon=True)
+    sender.start()
+    return disarmed, sender
 
 
 @pytest.fixture()
@@ -121,7 +124,8 @@ def test_signal_during_blocked_provider(relay_turn):
     timer.start()
     stream = None
     start = time.monotonic()
-    disarm = _interrupt_when_entered(entered)
+    stream_ready = threading.Event()
+    disarm, sender = _interrupt_when_entered(entered, stream_ready)
     try:
         with pytest.raises(KeyboardInterrupt):
             stream = relay_llm.stream(
@@ -133,9 +137,13 @@ def test_signal_during_blocked_provider(relay_turn):
                 metadata={"api_mode": "chat_completions"},
                 finalizer=dict,
             )
+            stream_ready.set()
             next(stream)
     finally:
         disarm.set()
+        stream_ready.set()
+        sender.join(10)
+        assert not sender.is_alive(), "SIGINT sender did not finish"
         signal.signal(signal.SIGINT, previous)
         release.set()
         timer.cancel()
@@ -158,25 +166,6 @@ def test_signal_during_blocked_provider(relay_turn):
     )
     assert stream._loop is None
     assert stream._runtime_lease is None
-
-
-class _FailingCloseIterator:
-    """Iterator whose ``close()`` always fails, to pin the deferred-close contract."""
-
-    def __init__(self, inner, error):
-        self._inner = inner
-        self._error = error
-        self.close_calls = 0
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        return next(self._inner)
-
-    def close(self):
-        self.close_calls += 1
-        raise self._error
 
 
 class _WarningWaiter(logging.Handler):
@@ -208,13 +197,18 @@ def test_failed_deferred_close_is_logged_not_raised(relay_turn):
     exception on the way out.
     """
     entered, release = threading.Event(), threading.Event()
+    close_calls = []
 
     def inner():
-        entered.set()
-        assert release.wait(10), "fixture release failed"
-        yield {"choices": [{"index": 0, "delta": {"content": "done"}}]}
+        try:
+            entered.set()
+            assert release.wait(10), "fixture release failed"
+            yield {"choices": [{"index": 0, "delta": {"content": "done"}}]}
+        finally:
+            close_calls.append(threading.get_ident())
+            raise RuntimeError("provider close failed")
 
-    iterator = _FailingCloseIterator(inner(), RuntimeError("provider close failed"))
+    iterator = inner()
 
     def provider(request):
         return iterator
@@ -225,7 +219,8 @@ def test_failed_deferred_close_is_logged_not_raised(relay_turn):
 
     previous = signal.signal(signal.SIGINT, interrupt)
     stream = None
-    disarm = _interrupt_when_entered(entered)
+    stream_ready = threading.Event()
+    disarm, sender = _interrupt_when_entered(entered, stream_ready)
     try:
         with pytest.raises(KeyboardInterrupt):
             stream = relay_llm.stream(
@@ -237,9 +232,13 @@ def test_failed_deferred_close_is_logged_not_raised(relay_turn):
                 metadata={"api_mode": "chat_completions"},
                 finalizer=dict,
             )
+            stream_ready.set()
             next(stream)
     finally:
         disarm.set()
+        stream_ready.set()
+        sender.join(10)
+        assert not sender.is_alive(), "SIGINT sender did not finish"
         signal.signal(signal.SIGINT, previous)
 
     assert stream is not None, "stream() did not return before the interrupt"
@@ -256,5 +255,73 @@ def test_failed_deferred_close_is_logged_not_raised(relay_turn):
     finally:
         release.set()
         relay_logger.removeHandler(waiter)
-    assert iterator.close_calls == 1, iterator.close_calls
+    assert len(close_calls) == 1, close_calls
     assert waiter.messages, "the deferred close failure was never logged"
+
+
+class _CloseUnblocksIterator:
+    """SDK-like handle: close from another thread is what releases next()."""
+
+    def __init__(self):
+        self.entered = threading.Event()
+        self.closed = threading.Event()
+        self.exited = threading.Event()
+        self.close_calls = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self.entered.set()
+        try:
+            assert self.closed.wait(10), "close did not unblock the SDK read"
+            raise StopIteration
+        finally:
+            self.exited.set()
+
+    def close(self):
+        self.close_calls += 1
+        self.closed.set()
+
+
+def test_interrupt_closes_sdk_handle_before_read_returns(relay_turn):
+    """Anti-regression: the unfixed base already closes SDK handles immediately."""
+    iterator = _CloseUnblocksIterator()
+
+    def interrupt(signum, frame):
+        assert iterator.entered.is_set(), "provider never started"
+        raise KeyboardInterrupt("interrupt during SDK read")
+
+    previous = signal.signal(signal.SIGINT, interrupt)
+    stream = None
+    stream_ready = threading.Event()
+    disarm, sender = _interrupt_when_entered(iterator.entered, stream_ready)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            stream = relay_llm.stream(
+                {"model": "test", "messages": [{"role": "user", "content": "hi"}]},
+                lambda request: iterator,
+                session_id="session-1",
+                name="custom",
+                model_name="test",
+                metadata={"api_mode": "chat_completions"},
+                finalizer=dict,
+            )
+            stream_ready.set()
+            next(stream)
+        assert stream is not None
+        stream.close()
+        assert iterator.closed.is_set(), "SDK close must run while next() is blocked"
+        assert iterator.exited.wait(3), "SDK read did not finish after close"
+        assert iterator.close_calls == 1
+        assert stream._loop is None
+        assert stream._runtime_lease is None
+    finally:
+        disarm.set()
+        stream_ready.set()
+        sender.join(10)
+        assert not sender.is_alive(), "SIGINT sender did not finish"
+        signal.signal(signal.SIGINT, previous)
+        iterator.closed.set()
+        if stream is not None:
+            stream.close()

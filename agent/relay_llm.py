@@ -357,29 +357,30 @@ class ManagedLlmStream(Iterator[Any]):
         # executing`` and would tear down a generator the worker still owns. Track the
         # read under a lock and hand the close to whichever side is not executing it:
         # immediately when the iterator is idle, otherwise deferred to the worker the
-        # moment its read returns.
+        # moment its read returns. SDK stream handles, unlike Python generators,
+        # must still close immediately: close() can unblock their pending read.
         close_guard = threading.Lock()
         close_state = {"reading": False, "close_requested": False, "closed": False}
 
         def _claim_close() -> bool:
-            """Take ownership of the close iff no worker is executing the iterator.
+            """Claim close once, deferring only an executing Python generator.
 
-            The claim is taken under the same lock that gates a read's ENTRY, so the
-            two decisions can never overlap: either the worker already claimed
-            ``reading`` and the caller defers instead, or the claim lands first and
+            The claim is taken under the same lock that gates a read's ENTRY, so
+            an executing generator defers to its worker. SDK handles can instead
+            close during a read to abort their connection. If close claims first,
             the worker sees ``closed`` and never enters the iterator.
             """
             with close_guard:
                 if close_state["closed"]:
                     return False
-                if close_state["reading"]:
+                if close_state["reading"] and inspect.isgenerator(raw_stream):
                     close_state["close_requested"] = True
                     return False
                 close_state["closed"] = True
                 return True
 
         def _close_when_safe() -> None:
-            """Close the provider iterator once, and only while it is not executing."""
+            """Close once; only executing Python generators require deferral."""
             if not _claim_close():
                 return
             close = getattr(raw_stream, "close", None)
